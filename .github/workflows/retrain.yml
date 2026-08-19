@@ -33,3 +33,25 @@ jobs:
           HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
         run: |
           python retrain.py
+
+  notify:
+    if: always()
+    needs: retrain
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Gmail notification
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.GMAIL_USERNAME }}
+          password: ${{ secrets.GMAIL_APP_PASSWORD }}
+          subject: AQI retraining workflow: ${{ needs.retrain.result }}
+          to: ${{ secrets.GMAIL_TO }}
+          from: AQI Retraining <${{ secrets.GMAIL_USERNAME }}>
+          body: |
+            The AQI model retraining workflow finished with status: ${{ needs.retrain.result }}.
+            Repository: ${{ github.repository }}
+            Commit: ${{ github.sha }}
+            Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
