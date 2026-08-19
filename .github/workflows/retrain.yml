@@ -48,7 +48,7 @@ jobs:
           username: ${{ secrets.GMAIL_USERNAME }}
           password: ${{ secrets.GMAIL_APP_PASSWORD }}
           subject: AQI retraining workflow: ${{ needs.retrain.result }}
-          to: ${{ secrets.GMAIL_TO }}
+          to: 70169383@student.uol.edu.pk
           from: AQI Retraining <${{ secrets.GMAIL_USERNAME }}>
           body: |
             The AQI model retraining workflow finished with status: ${{ needs.retrain.result }}.
