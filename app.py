@@ -295,9 +295,32 @@ def render_shap_explainability(model, feature_names, historical, forecast_daily,
     """Render a compact SHAP explanation for the current AQI forecast — styled to match the dark dashboard theme."""
     try:
         x_vec = build_feature_vector(historical, forecast_daily, feature_names)
-        background = np.tile(x_vec[0], (25, 1))
-        explainer = shap.Explainer(model, background)
-        explanation = explainer(x_vec)
+
+        # GradientBoostingRegressor is tree-based, so TreeExplainer computes exact
+        # Shapley values from the tree structure itself — no background sample needed.
+        # (Using a background made of copies of the same instance, as before, made every
+        # perturbation a no-op and forced all SHAP values to 0.)
+        try:
+            explainer = shap.TreeExplainer(model, feature_perturbation="tree_path_dependent")
+            explanation = explainer(x_vec)
+        except Exception:
+            # Fallback for non-tree models: use real historical rows as background,
+            # never copies of the instance being explained.
+            hist_feature_rows = []
+            for i in range(1, min(21, len(historical) - 5)):
+                try:
+                    as_of = historical.index.max().date() - timedelta(days=i)
+                    hist_slice = historical.loc[historical.index.date <= as_of]
+                    if len(hist_slice) < 35:
+                        continue
+                    hist_feature_rows.append(
+                        build_feature_vector(hist_slice, forecast_daily, feature_names)[0]
+                    )
+                except Exception:
+                    continue
+            background = np.array(hist_feature_rows) if hist_feature_rows else np.tile(x_vec[0], (5, 1))
+            explainer = shap.Explainer(model, background)
+            explanation = explainer(x_vec)
 
         values = np.asarray(explanation.values)
         if values.ndim == 3:
