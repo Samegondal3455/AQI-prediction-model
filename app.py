@@ -207,6 +207,17 @@ st.markdown("""
 
     ::-webkit-scrollbar { width: 8px; }
     ::-webkit-scrollbar-thumb { background: #2c5364; border-radius: 10px; }
+
+    /* SHAP matplotlib figures are drawn on a light background by design.
+       Wrap every rendered image in a white rounded card instead of letting
+       it clash directly with the dark app background. */
+    [data-testid="stImage"] {
+        background: #ffffff;
+        border-radius: 18px;
+        padding: 16px;
+        box-shadow: 0 8px 28px rgba(0,0,0,0.35);
+        border: 1px solid rgba(255,255,255,0.08);
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -293,25 +304,60 @@ def aqi_gauge_chart(value, title):
 
 
 def render_shap_explainability(model, feature_names, historical, forecast_daily, day_label):
-    """Render a compact SHAP explanation for the current AQI forecast."""
+    """Render a compact, theme-matched SHAP explanation for the current AQI forecast."""
     try:
         x_vec = build_feature_vector(historical, forecast_daily, feature_names)
-        background = np.tile(x_vec[0], (25, 1))
-        explainer = shap.Explainer(model, background)
+
+        # Use TreeExplainer directly — the models are tree-based (GradientBoosting),
+        # so this is deterministic, fast, and gives correct SHAP values (the previous
+        # generic shap.Explainer + duplicated-row background produced noisy/odd results).
+        explainer = shap.TreeExplainer(model)
         explanation = explainer(x_vec)
 
         values = np.asarray(explanation.values)[0]
-        contribs = pd.Series(np.abs(values), index=feature_names).sort_values(ascending=False).head(8)
+        contrib_series = pd.Series(values, index=feature_names)
+        top_contribs = contrib_series.reindex(
+            contrib_series.abs().sort_values(ascending=False).head(8).index
+        )
 
         st.markdown(f"### 🔍 SHAP Explainability — {day_label}")
         st.caption("Positive SHAP values push AQI upward; negative values reduce the predicted air pollution level.")
-        st.bar_chart(contribs)
 
-        plt.figure(figsize=(10, 6))
-        shap.plots.beeswarm(explanation[0], max_display=10, show=False)
+        # ---- Feature-impact bar chart, styled to match the dark dashboard ----
+        bar_colors = ["#e74c3c" if v > 0 else "#2ecc71" for v in top_contribs.values]
+        bar_fig = go.Figure(go.Bar(
+            x=top_contribs.values,
+            y=top_contribs.index,
+            orientation="h",
+            marker_color=bar_colors,
+            text=[f"{v:+.2f}" for v in top_contribs.values],
+            textposition="outside",
+        ))
+        bar_fig.update_layout(
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(255,255,255,0.02)",
+            font=dict(color="#dfe9f3"),
+            margin=dict(l=10, r=50, t=10, b=10),
+            height=320,
+            xaxis=dict(
+                gridcolor="rgba(255,255,255,0.08)",
+                zerolinecolor="rgba(255,255,255,0.35)",
+                title="SHAP value (impact on predicted AQI)",
+            ),
+            yaxis=dict(autorange="reversed"),
+        )
+        st.plotly_chart(bar_fig, use_container_width=True, key=f"shap_bar_{day_label.replace(' ', '_')}")
+
+        # ---- Waterfall plot (SHAP's own renderer assumes a light background,
+        #      so we size it generously and let it render on white — the CSS
+        #      above wraps it in a rounded white card so it looks intentional
+        #      against the dark theme instead of clashing). ----
+        fig = plt.figure(figsize=(9, 5.5), dpi=150)
+        shap.plots.waterfall(explanation[0], max_display=9, show=False)
         plt.tight_layout()
-        st.pyplot(plt.gcf())
-        plt.close()
+        st.pyplot(fig, clear_figure=True)
+        plt.close(fig)
+
     except Exception as exc:
         st.info(f"SHAP explanation for {day_label} is unavailable right now: {exc}")
 
