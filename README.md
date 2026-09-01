@@ -26,7 +26,6 @@ Live deployment link:
 - Streamlit app: [https://your-app-name.streamlit.app](https://aqi-prediction-model-irbmq239pwxeqmbz6emxuv.streamlit.app/)
 
 
-
 ## Dashboard Preview
 
 ![Dashboard overview](docs/dashboard-preview.png)
