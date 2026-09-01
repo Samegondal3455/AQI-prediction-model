@@ -301,19 +301,35 @@ def render_shap_explainability(model, feature_names, historical, forecast_daily,
         explanation = explainer(x_vec)
 
         values = np.asarray(explanation.values)
-        if values.ndim > 2:
-            values = values.reshape(values.shape[0], -1)
-        if values.ndim == 2 and values.shape[0] == 1:
+        if values.ndim == 3:
             values = values[0]
+        elif values.ndim == 2 and values.shape[0] == 1:
+            values = values[0]
+        elif values.ndim == 0:
+            values = np.asarray([0.0] * len(feature_names))
 
-        contribs = pd.Series(np.abs(values), index=feature_names).sort_values(ascending=False).head(8)
+        if values.size != len(feature_names):
+            values = np.asarray(values).reshape(-1)
+            if values.size < len(feature_names):
+                pad = np.zeros(len(feature_names) - values.size)
+                values = np.concatenate([values, pad])
+
+        abs_vals = np.abs(np.asarray(values, dtype=float))
+        if abs_vals.sum() == 0:
+            abs_vals = np.ones_like(abs_vals)
+
+        contribs = pd.Series((abs_vals / abs_vals.sum()) * 100, index=feature_names).sort_values(ascending=False).head(8)
 
         st.markdown(f"### 🔍 SHAP Explainability — {day_label}")
         st.caption("Positive SHAP values push AQI upward; negative values reduce the predicted air pollution level.")
         st.bar_chart(contribs)
 
-        plt.figure(figsize=(10, 6))
-        shap.plots.beeswarm(explanation[0], max_display=10, show=False)
+        plt.figure(figsize=(10, 5))
+        plt.barh(list(contribs.index), list(contribs.values), color="#7dd3fc")
+        plt.gca().invert_yaxis()
+        plt.xlabel("Relative contribution (%)")
+        plt.ylabel("Feature")
+        plt.title(f"Top feature contributions — {day_label}")
         plt.tight_layout()
         st.pyplot(plt.gcf())
         plt.close()
