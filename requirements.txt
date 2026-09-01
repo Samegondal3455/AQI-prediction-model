@@ -1,11 +1,11 @@
 streamlit
 pandas
 numpy
-xgboost
-scikit-learn
 joblib
+hopsworks
+plotly
+requests
+python-dotenv
+scikit-learn
 shap
 matplotlib
-hopsworks==5.0.3
-plotly
-python-dotenv

@@ -10,7 +10,6 @@ import types
 import requests
 import plotly.graph_objects as go
 import matplotlib.pyplot as plt
-import shap
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from datetime import datetime, timedelta
@@ -207,6 +206,7 @@ st.markdown("""
 
     ::-webkit-scrollbar { width: 8px; }
     ::-webkit-scrollbar-thumb { background: #2c5364; border-radius: 10px; }
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -290,30 +290,6 @@ def aqi_gauge_chart(value, title):
         margin=dict(l=20, r=20, t=50, b=10),
     )
     return fig
-
-
-def render_shap_explainability(model, feature_names, historical, forecast_daily, day_label):
-    """Render a compact SHAP explanation for the current AQI forecast."""
-    try:
-        x_vec = build_feature_vector(historical, forecast_daily, feature_names)
-        background = np.tile(x_vec[0], (25, 1))
-        explainer = shap.Explainer(model, background)
-        explanation = explainer(x_vec)
-
-        values = np.asarray(explanation.values)[0]
-        contribs = pd.Series(np.abs(values), index=feature_names).sort_values(ascending=False).head(8)
-
-        st.markdown(f"### 🔍 SHAP Explainability — {day_label}")
-        st.caption("Positive SHAP values push AQI upward; negative values reduce the predicted air pollution level.")
-        st.bar_chart(contribs)
-
-        plt.figure(figsize=(10, 6))
-        shap.plots.beeswarm(explanation[0], max_display=10, show=False)
-        plt.tight_layout()
-        st.pyplot(plt.gcf())
-        plt.close()
-    except Exception as exc:
-        st.info(f"SHAP explanation for {day_label} is unavailable right now: {exc}")
 
 
 # ============================================================
@@ -786,18 +762,6 @@ if run_forecast:
                 height=420,
             )
             st.plotly_chart(trend_fig, use_container_width=True)
-
-            # ---------------- SHAP EXPLAINABILITY ----------------
-            st.markdown("### 🧠 Model Interpretation")
-            for label in ["Day 1", "Day 2", "Day 3"]:
-                model_info = models[label]
-                render_shap_explainability(
-                    model_info["model"],
-                    model_info["features"],
-                    historical,
-                    forecast_daily,
-                    label,
-                )
 
             # ---------------- RAW TABLE ----------------
             with st.expander("📋 View Raw Forecast Table"):
