@@ -9,7 +9,6 @@ import sys
 import types
 import requests
 import plotly.graph_objects as go
-import matplotlib.pyplot as plt
 import shap
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -293,7 +292,7 @@ def aqi_gauge_chart(value, title):
 
 
 def render_shap_explainability(model, feature_names, historical, forecast_daily, day_label):
-    """Render a compact SHAP explanation for the current AQI forecast."""
+    """Render a compact SHAP explanation for the current AQI forecast — styled to match the dark dashboard theme."""
     try:
         x_vec = build_feature_vector(historical, forecast_daily, feature_names)
         background = np.tile(x_vec[0], (25, 1))
@@ -314,25 +313,60 @@ def render_shap_explainability(model, feature_names, historical, forecast_daily,
                 pad = np.zeros(len(feature_names) - values.size)
                 values = np.concatenate([values, pad])
 
-        abs_vals = np.abs(np.asarray(values, dtype=float))
+        raw_vals = np.asarray(values, dtype=float)
+        abs_vals = np.abs(raw_vals)
         if abs_vals.sum() == 0:
             abs_vals = np.ones_like(abs_vals)
 
-        contribs = pd.Series((abs_vals / abs_vals.sum()) * 100, index=feature_names).sort_values(ascending=False).head(8)
+        contrib_pct = pd.Series((abs_vals / abs_vals.sum()) * 100, index=feature_names)
+        signed = pd.Series(raw_vals, index=feature_names)
+
+        top = contrib_pct.sort_values(ascending=False).head(8)
+        top_signed = signed.loc[top.index]
+
+        # Sort ascending so the biggest contributor lands at the top of the horizontal chart
+        order = top.sort_values(ascending=True).index
+        top = top.loc[order]
+        top_signed = top_signed.loc[order]
+
+        bar_colors = ["#ff6b6b" if v > 0 else "#5dade2" for v in top_signed.values]
 
         st.markdown(f"### 🔍 SHAP Explainability — {day_label}")
-        st.caption("Positive SHAP values push AQI upward; negative values reduce the predicted air pollution level.")
-        st.bar_chart(contribs)
+        st.caption("🔴 Red bars push AQI upward · 🔵 Blue bars pull AQI downward. Bar length = relative importance.")
 
-        plt.figure(figsize=(10, 5))
-        plt.barh(list(contribs.index), list(contribs.values), color="#7dd3fc")
-        plt.gca().invert_yaxis()
-        plt.xlabel("Relative contribution (%)")
-        plt.ylabel("Feature")
-        plt.title(f"Top feature contributions — {day_label}")
-        plt.tight_layout()
-        st.pyplot(plt.gcf())
-        plt.close()
+        fig = go.Figure(go.Bar(
+            x=top.values,
+            y=top.index,
+            orientation="h",
+            marker=dict(
+                color=bar_colors,
+                line=dict(color="rgba(255,255,255,0.15)", width=1),
+            ),
+            text=[f"{v:.1f}%" for v in top.values],
+            textposition="outside",
+            textfont=dict(color="#e6edf3", size=12),
+            hovertemplate="<b>%{y}</b><br>Contribution: %{x:.2f}%<extra></extra>",
+        ))
+
+        fig.update_layout(
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(255,255,255,0.02)",
+            font=dict(color="#dfe9f3", family="Poppins, sans-serif"),
+            margin=dict(l=10, r=40, t=20, b=10),
+            height=320,
+            xaxis=dict(
+                title="Relative contribution (%)",
+                gridcolor="rgba(255,255,255,0.06)",
+                zerolinecolor="rgba(255,255,255,0.15)",
+            ),
+            yaxis=dict(
+                gridcolor="rgba(255,255,255,0.03)",
+                automargin=True,
+            ),
+            showlegend=False,
+        )
+        st.plotly_chart(fig, use_container_width=True, key=f"shap_{day_label}")
+
     except Exception as exc:
         st.info(f"SHAP explanation for {day_label} is unavailable right now: {exc}")
 
