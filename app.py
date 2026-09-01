@@ -2,15 +2,30 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import joblib
-import hopsworks
+try:
+    import hopsworks
+    HOPSWORKS_AVAILABLE = True
+except Exception:
+    hopsworks = None
+    HOPSWORKS_AVAILABLE = False
 import os
 import re
 import sys
 import types
 import requests
-import plotly.graph_objects as go
-import matplotlib.pyplot as plt
-import shap
+try:
+    import shap
+    SHAP_AVAILABLE = True
+except Exception:
+    shap = None
+    SHAP_AVAILABLE = False
+# Redeploy trigger: update to force Streamlit Cloud rebuild
+try:
+    import plotly.graph_objects as go
+    PLOTLY_AVAILABLE = True
+except Exception:
+    go = None
+    PLOTLY_AVAILABLE = False
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from datetime import datetime, timedelta
@@ -241,6 +256,98 @@ def ensure_sklearn_loss_compat():
 
 ensure_sklearn_loss_compat()
 
+# Compatibility shim for numpy BitGenerator changes across numpy versions (MT19937 registry)
+def ensure_numpy_bitgenerator_compat():
+    """Best-effort: try multiple known numpy internals locations and registries
+    to register MT19937 so older pickles referencing numpy.random._mt19937.MT19937
+    can be unpickled. This mutates internals if possible; it is safe to call
+    repeatedly and fails silently on platforms where internals differ.
+    """
+    try:
+        import importlib
+        mt = importlib.import_module('numpy.random._mt19937')
+        candidates = [
+            'numpy.random._bit_generator',
+            'numpy.random._pickle',
+            'numpy.random._generator',
+            'numpy.random',
+        ]
+        attr_names = ['_bit_generator_registry', 'bit_generator_registry', '_bit_gen_registry', 'BIT_GENERATOR_REGISTRY']
+        for mod_name in candidates:
+            try:
+                mod = importlib.import_module(mod_name)
+            except Exception:
+                continue
+            for attr in attr_names:
+                if hasattr(mod, attr):
+                    reg = getattr(mod, attr)
+                    try:
+                        if isinstance(reg, dict) and 'MT19937' not in reg:
+                            reg['MT19937'] = mt.MT19937
+                    except Exception:
+                        pass
+        # Also try to expose MT19937 in numpy.random namespace if present
+        try:
+            nr = importlib.import_module('numpy.random')
+            if not hasattr(nr, 'MT19937'):
+                setattr(nr, 'MT19937', mt.MT19937)
+        except Exception:
+            pass
+    except Exception:
+        # Nothing we can do; callers will handle unpickle failure
+        pass
+
+ensure_numpy_bitgenerator_compat()
+
+# Safe joblib loader that retries after attempting to register MT19937
+def safe_joblib_load(path):
+    try:
+        return joblib.load(path)
+    except ValueError as e:
+        msg = str(e)
+        if 'is not a known BitGenerator' in msg or 'MT19937' in msg:
+            # 1) Try to repair numpy internals and retry
+            ensure_numpy_bitgenerator_compat()
+            try:
+                return joblib.load(path)
+            except Exception:
+                pass
+
+            # 2) If that fails, try monkeypatching numpy.random._pickle.__bit_generator_ctor
+            try:
+                import importlib
+                np_pickle = importlib.import_module('numpy.random._pickle')
+                mt_mod = importlib.import_module('numpy.random._mt19937')
+                MT = getattr(mt_mod, 'MT19937', None)
+
+                original_ctor = getattr(np_pickle, '__bit_generator_ctor', None)
+
+                def _patched_ctor(bit_generator_name, *args, **kwargs):
+                    # If bit_generator_name is a class object named MT19937, map to the known MT class
+                    try:
+                        return original_ctor(bit_generator_name, *args, **kwargs)
+                    except Exception:
+                        try:
+                            if getattr(bit_generator_name, '__name__', '') == 'MT19937' and MT is not None:
+                                return MT
+                        except Exception:
+                            pass
+                        raise
+
+                if original_ctor is not None:
+                    np_pickle.__bit_generator_ctor = _patched_ctor
+                    try:
+                        return joblib.load(path)
+                    finally:
+                        # restore original to avoid side-effects
+                        np_pickle.__bit_generator_ctor = original_ctor
+            except Exception:
+                pass
+
+        # re-raise original error if none of the recovery attempts worked
+        raise
+
+
 # ============================================================
 # AQI CATEGORY HELPERS (US AQI breakpoints)
 # ============================================================
@@ -261,6 +368,8 @@ def get_aqi_category(aqi):
 
 
 def aqi_gauge_chart(value, title):
+    if not PLOTLY_AVAILABLE:
+        return None
     label, color, emoji, _ = get_aqi_category(value)
     fig = go.Figure(go.Indicator(
         mode="gauge+number",
@@ -292,28 +401,57 @@ def aqi_gauge_chart(value, title):
     return fig
 
 
-def render_shap_explainability(model, feature_names, historical, forecast_daily, day_label):
-    """Render a compact SHAP explanation for the current AQI forecast."""
-    try:
-        x_vec = build_feature_vector(historical, forecast_daily, feature_names)
-        background = np.tile(x_vec[0], (25, 1))
-        explainer = shap.Explainer(model, background)
-        explanation = explainer(x_vec)
+# ============================================================
+# SHAP EXPLAINABILITY HELPERS
+# ============================================================
+@st.cache_resource(show_spinner=False)
+def get_shap_explainer(_model):
+    """Build (and cache) a SHAP TreeExplainer for a given GradientBoosting model."""
+    return shap.TreeExplainer(_model)
 
-        values = np.asarray(explanation.values)[0]
-        contribs = pd.Series(np.abs(values), index=feature_names).sort_values(ascending=False).head(8)
 
-        st.markdown(f"### 🔍 SHAP Explainability — {day_label}")
-        st.caption("Positive SHAP values push AQI upward; negative values reduce the predicted air pollution level.")
-        st.bar_chart(contribs)
+def compute_shap_for_day(model, feature_names, x_vec):
+    """Return a DataFrame of feature -> SHAP contribution for one prediction."""
+    explainer = get_shap_explainer(model)
+    shap_values = explainer.shap_values(x_vec)
+    base_value = explainer.expected_value
+    if isinstance(base_value, (list, np.ndarray)):
+        base_value = float(np.array(base_value).flatten()[0])
 
-        plt.figure(figsize=(10, 6))
-        shap.plots.beeswarm(explanation[0], max_display=10, show=False)
-        plt.tight_layout()
-        st.pyplot(plt.gcf())
-        plt.close()
-    except Exception as exc:
-        st.info(f"SHAP explanation for {day_label} is unavailable right now: {exc}")
+    contrib = pd.DataFrame({
+        "feature": feature_names,
+        "shap_value": np.array(shap_values).flatten(),
+    })
+    contrib["abs_val"] = contrib["shap_value"].abs()
+    contrib = contrib.sort_values("abs_val", ascending=False)
+    return contrib, base_value
+
+
+def shap_bar_chart(contrib_df, title, top_n=10):
+    if not PLOTLY_AVAILABLE:
+        return None
+    plot_df = contrib_df.head(top_n).sort_values("shap_value")
+    colors = ["#e74c3c" if v > 0 else "#2ecc71" for v in plot_df["shap_value"]]
+
+    fig = go.Figure(go.Bar(
+        x=plot_df["shap_value"],
+        y=plot_df["feature"],
+        orientation="h",
+        marker=dict(color=colors),
+        text=[f"{v:+.2f}" for v in plot_df["shap_value"]],
+        textposition="outside",
+    ))
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=15, color="#dfe9f3")),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(255,255,255,0.02)",
+        font=dict(color="#dfe9f3"),
+        xaxis=dict(title="Impact on predicted AQI", gridcolor="rgba(255,255,255,0.06)", zerolinecolor="rgba(255,255,255,0.2)"),
+        yaxis=dict(gridcolor="rgba(255,255,255,0.06)"),
+        margin=dict(l=10, r=40, t=50, b=10),
+        height=380,
+    )
+    return fig
 
 
 # ============================================================
@@ -600,7 +738,7 @@ def load_all_models(key):
                 elif file.endswith(".pkl") or file.endswith(".joblib"):
                     if file == "features.pkl":
                         continue
-                    raw_obj = joblib.load(file_path)
+                    raw_obj = safe_joblib_load(file_path)
                     extracted = extract_model(raw_obj)
                     if extracted is not None:
                         model_obj = extracted
@@ -620,16 +758,175 @@ def load_all_models(key):
     return models_dict
 
 models = None
-if api_key:
+# Defer loading models until a user action to avoid startup crashes during unpickle errors.
+import tempfile
+import zipfile
+import tarfile
+import shutil
+
+MODEL_ARTIFACTS_INFO = [
+    ("sargodha_aqi_gbr_day1", 4, "Day 1"),
+    ("sargodha_aqi_gbr_day2", 3, "Day 2"),
+    ("sargodha_aqi_gbr_day3", 3, "Day 3"),
+]
+
+
+def _download_and_extract(url, dest_dir):
+    """Download a single artifact and extract into dest_dir. Returns path to extracted folder or raises."""
+    r = requests.get(url, stream=True, timeout=60)
+    r.raise_for_status()
+    fname = url.split("/")[-1]
+    local_path = os.path.join(dest_dir, fname)
+    with open(local_path, "wb") as fh:
+        for chunk in r.iter_content(chunk_size=8192):
+            if chunk:
+                fh.write(chunk)
+    # Try to extract
     try:
-        models = load_all_models(api_key)
-        st.sidebar.success("✅ Day 1, 2, 3 Models Ready!")
-    except Exception as e:
-        st.sidebar.error(f"Error loading models: {e}")
-        import traceback
-        st.sidebar.code(traceback.format_exc())
+        if zipfile.is_zipfile(local_path):
+            with zipfile.ZipFile(local_path, "r") as z:
+                z.extractall(dest_dir)
+            return dest_dir
+        elif tarfile.is_tarfile(local_path):
+            with tarfile.open(local_path, "r:*") as t:
+                t.extractall(dest_dir)
+            return dest_dir
+        else:
+            # Not an archive; if it's a single joblib/pkl, create a folder and move
+            single_dir = os.path.join(dest_dir, os.path.splitext(fname)[0])
+            os.makedirs(single_dir, exist_ok=True)
+            shutil.move(local_path, os.path.join(single_dir, fname))
+            return single_dir
+    finally:
+        # keep local_path for debugging if needed
+        pass
+
+
+def _load_models_from_dir(model_dir_root):
+    models_dict = {}
+    for m_name, m_ver, label in MODEL_ARTIFACTS_INFO:
+        # Look for a folder named after the model, or scan for files
+        model_obj = None
+        feature_names = None
+        # First check a subfolder
+        candidate_dirs = [
+            os.path.join(model_dir_root, m_name),
+            model_dir_root,
+        ]
+        for search_dir in candidate_dirs:
+            if not os.path.isdir(search_dir):
+                continue
+            for root, dirs, files in os.walk(search_dir):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    if file == "features.pkl":
+                        try:
+                            feature_names = joblib.load(file_path)
+                        except Exception:
+                            pass
+                    elif file.endswith(".pkl") or file.endswith(".joblib"):
+                        if file == "features.pkl":
+                            continue
+                        try:
+                            raw_obj = safe_joblib_load(file_path)
+                            extracted = extract_model(raw_obj)
+                            if extracted is not None:
+                                model_obj = extracted
+                        except Exception:
+                            # ignore and continue to try other files
+                            pass
+                if model_obj is not None and feature_names is not None:
+                    break
+            if model_obj is not None and feature_names is not None:
+                break
+
+        if model_obj is None or feature_names is None:
+            raise ValueError(f"Could not find usable model and features for {m_name} in {model_dir_root}")
+
+        models_dict[label] = {"model": model_obj, "features": feature_names}
+    return models_dict
+
+
+if api_key:
+    st.sidebar.markdown("### 🔁 Model Loading")
+    if not HOPSWORKS_AVAILABLE:
+        st.sidebar.warning(
+            "Hopsworks client not installed in this environment. Models cannot be loaded from Hopsworks here."
+        )
+        st.sidebar.markdown(
+            "If you need model loading in this Cloud deployment, either install `hopsworks` in the environment (not recommended on Streamlit Cloud), "
+            "or provide model artifacts via a public URL so the app can download them without the hopsworks client."
+        )
+
+        # New: allow users to provide a base URL for model artifacts (or exact per-model URLs)
+        st.sidebar.markdown("#### Alternative: Download model artifacts from URL")
+        artifacts_base = st.sidebar.text_input(
+            "Model artifacts base URL (use {model} in the path; e.g. https://example.com/artifacts/{model}.zip)",
+            value="",
+            placeholder="https://raw.githubusercontent.com/<user>/<repo>/main/artifacts/{model}.zip",
+            key="artifacts_base_url",
+        )
+        if artifacts_base:
+            st.sidebar.caption("You can use the token {model} in the URL; it will be replaced with each model name.")
+            if st.sidebar.button("Download models from URL"):
+                with st.sidebar.spinner("Downloading model artifacts..."):
+                    tmp = tempfile.mkdtemp(prefix="models_")
+                    try:
+                        # For each model, format URL and attempt download/extract
+                        for m_name, m_ver, label in MODEL_ARTIFACTS_INFO:
+                            attempt_url = artifacts_base.replace("{model}", m_name)
+                            try:
+                                _download_and_extract(attempt_url, tmp)
+                            except Exception as e:
+                                st.sidebar.error(f"Failed to download/extract for {m_name}: {e}")
+                                raise
+                        # Now try to load models from the tmp dir
+                        models = _load_models_from_dir(tmp)
+                        st.sidebar.success("✅ Models downloaded and loaded from provided URLs.")
+                    except Exception as e:
+                        st.sidebar.error(f"Model download/load failed: {e}")
+                        models = None
+                    finally:
+                        # keep tmp for debugging; do not remove automatically
+                        st.sidebar.info(f"Downloaded artifacts stored at: {tmp}")
+
+        # Offer an on-demand installer when the user explicitly requests it. This may take time and can fail due to permission or dependency conflicts.
+        if st.sidebar.button("Install hopsworks now (attempt runtime pip install)"):
+            with st.sidebar.spinner("Installing hopsworks (this may take a minute)..."):
+                import subprocess, sys
+                try:
+                    cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "hopsworks==5.0.*"]
+                    proc = subprocess.run(cmd, capture_output=True, text=True)
+                    out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+                    if proc.returncode == 0:
+                        try:
+                            import importlib
+                            hopsworks = importlib.import_module("hopsworks")
+                            HOPSWORKS_AVAILABLE = True
+                            st.sidebar.success("hopsworks installed and imported successfully. You can now click 'Load models from Hopsworks'.")
+                        except Exception as e:
+                            st.sidebar.error(f"Installed but import failed: {e}")
+                            st.sidebar.text(out)
+                    else:
+                        st.sidebar.error("Installation failed; see details below.")
+                        st.sidebar.text(out)
+                except Exception as e:
+                    st.sidebar.error(f"Installation attempt raised an exception: {e}")
+    else:
+        if st.sidebar.button("Load models from Hopsworks"):
+            with st.sidebar.spinner("Loading models from Hopsworks..."):
+                try:
+                    models = load_all_models(api_key)
+                    st.sidebar.success("✅ Day 1, 2, 3 Models Ready!")
+                except Exception as e:
+                    # Don't show full traceback to avoid long crashes in the UI; log concise message and continue.
+                    st.sidebar.error("Failed to load models from Hopsworks. The app will run in offline mode.")
+                    st.sidebar.text(str(e))
+                    models = None
+        else:
+            st.sidebar.info("Models are not loaded. Click 'Load models from Hopsworks' to attempt loading.")
 else:
-    st.info("👈 HOPSWORKS_API_KEY set nahi hai. Terminal me export karo ya project root me .env file create karo.")
+    st.sidebar.warning("⚠️ HOPSWORKS_API_KEY not found. Set it in .env, Streamlit secrets, or paste it here.")
 
 # --- 3. LIVE DATA UI ---
 st.markdown("### 📡 Live Weather & Air Quality — Sargodha")
@@ -674,17 +971,26 @@ if run_forecast:
                 forecast_daily = fetch_forecast_weather(LATITUDE, LONGITUDE, horizon_days=5)
 
                 preds = []
+                x_vectors = {}  # keep feature vectors for SHAP, keyed by day label
                 for label in ["Day 1", "Day 2", "Day 3"]:
                     model_info = models[label]
                     model = model_info["model"]
                     feature_names = model_info["features"]
                     x_vec = build_feature_vector(historical, forecast_daily, feature_names)
+                    x_vectors[label] = x_vec
                     preds.append(float(model.predict(x_vec)[0]))
+
+            # stash results in session_state so the SHAP expander below can reuse them
+            # without re-fetching data on every rerun
+            st.session_state["last_preds"] = preds
+            st.session_state["last_x_vectors"] = x_vectors
+            st.session_state["last_historical"] = historical
 
             today = datetime.now()
             dates = [(today + timedelta(days=i + 1)) for i in range(3)]
             date_labels = [d.strftime("%d %b (%a)") for d in dates]
             preds = [round(v, 1) for v in preds]
+            st.session_state["last_date_labels"] = date_labels
 
             # ---------------- HAZARD BANNER ----------------
             max_aqi = max(preds)
@@ -735,7 +1041,12 @@ if run_forecast:
             gcols = st.columns(3)
             for i, col in enumerate(gcols):
                 with col:
-                    st.plotly_chart(aqi_gauge_chart(preds[i], f"Day {i+1} — {date_labels[i]}"), use_container_width=True)
+                    fig = aqi_gauge_chart(preds[i], f"Day {i+1} — {date_labels[i]}")
+                    if PLOTLY_AVAILABLE and fig is not None:
+                        st.plotly_chart(fig, use_container_width=True)
+                    else:
+                        label, color, emoji, _ = get_aqi_category(preds[i])
+                        st.markdown(f"**Day {i+1} — {date_labels[i]}:** {preds[i]:.0f} — {emoji} {label}")
 
             # ---------------- TREND CHART: HISTORY + FORECAST ----------------
             st.markdown("### 📈 AQI Trend — Last 14 Days + 3-Day Model Forecast")
@@ -744,60 +1055,54 @@ if run_forecast:
             hist_dates = list(hist_tail.index.date)
             hist_values = list(hist_tail["AQI"].values)
 
-            trend_fig = go.Figure()
-
-            # Historical actual AQI
-            trend_fig.add_trace(go.Scatter(
-                x=hist_dates,
-                y=hist_values,
-                mode="lines+markers",
-                name="Historical AQI",
-                line=dict(color="#5dade2", width=3),
-                marker=dict(size=6),
-            ))
-
-            # Bridge point connecting history to forecast
             bridge_x = [hist_dates[-1]] + [d.date() for d in dates]
             bridge_y = [hist_values[-1]] + preds
 
-            trend_fig.add_trace(go.Scatter(
-                x=bridge_x,
-                y=bridge_y,
-                mode="lines+markers",
-                name="Model Forecast",
-                line=dict(color="#f39c12", width=3, dash="dash"),
-                marker=dict(size=10, symbol="diamond"),
-            ))
+            if PLOTLY_AVAILABLE:
+                trend_fig = go.Figure()
 
-            # Hazard threshold reference lines
-            for level, color, name in [(100, "#f1c40f", "Moderate"), (150, "#e67e22", "Unhealthy (Sensitive)"),
-                                        (200, "#e74c3c", "Unhealthy"), (300, "#8e44ad", "Very Unhealthy")]:
-                trend_fig.add_hline(y=level, line_dash="dot", line_color=color, opacity=0.5,
-                                     annotation_text=name, annotation_font_color=color, annotation_font_size=10)
+                # Historical actual AQI
+                trend_fig.add_trace(go.Scatter(
+                    x=hist_dates,
+                    y=hist_values,
+                    mode="lines+markers",
+                    name="Historical AQI",
+                    line=dict(color="#5dade2", width=3),
+                    marker=dict(size=6),
+                ))
 
-            trend_fig.update_layout(
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(255,255,255,0.02)",
-                font=dict(color="#dfe9f3"),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                margin=dict(l=10, r=10, t=40, b=10),
-                xaxis=dict(gridcolor="rgba(255,255,255,0.06)", title="Date"),
-                yaxis=dict(gridcolor="rgba(255,255,255,0.06)", title="AQI"),
-                height=420,
-            )
-            st.plotly_chart(trend_fig, use_container_width=True)
+                trend_fig.add_trace(go.Scatter(
+                    x=bridge_x,
+                    y=bridge_y,
+                    mode="lines+markers",
+                    name="Model Forecast",
+                    line=dict(color="#f39c12", width=3, dash="dash"),
+                    marker=dict(size=10, symbol="diamond"),
+                ))
 
-            # ---------------- SHAP EXPLAINABILITY ----------------
-            st.markdown("### 🧠 Model Interpretation")
-            for label in ["Day 1", "Day 2", "Day 3"]:
-                model_info = models[label]
-                render_shap_explainability(
-                    model_info["model"],
-                    model_info["features"],
-                    historical,
-                    forecast_daily,
-                    label,
+                # Hazard threshold reference lines
+                for level, color, name in [(100, "#f1c40f", "Moderate"), (150, "#e67e22", "Unhealthy (Sensitive)"),
+                                            (200, "#e74c3c", "Unhealthy"), (300, "#8e44ad", "Very Unhealthy")]:
+                    trend_fig.add_hline(y=level, line_dash="dot", line_color=color, opacity=0.5,
+                                         annotation_text=name, annotation_font_color=color, annotation_font_size=10)
+
+                trend_fig.update_layout(
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(255,255,255,0.02)",
+                    font=dict(color="#dfe9f3"),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    margin=dict(l=10, r=10, t=40, b=10),
+                    xaxis=dict(gridcolor="rgba(255,255,255,0.06)", title="Date"),
+                    yaxis=dict(gridcolor="rgba(255,255,255,0.06)", title="AQI"),
+                    height=420,
                 )
+                st.plotly_chart(trend_fig, use_container_width=True)
+            else:
+                # Fallback: show a simple line chart with Streamlit if plotly isn't available
+                bridge_df = pd.DataFrame({"Date": bridge_x, "AQI": bridge_y})
+                bridge_df["Date"] = pd.to_datetime(bridge_df["Date"]).dt.date
+                bridge_df = bridge_df.set_index("Date")
+                st.line_chart(bridge_df["AQI"])
 
             # ---------------- RAW TABLE ----------------
             with st.expander("📋 View Raw Forecast Table"):
@@ -810,3 +1115,77 @@ if run_forecast:
 
         except Exception as err:
             st.error(f"Prediction Error: {err}")
+
+# ============================================================
+# 5. SHAP EXPLAINABILITY SECTION
+# Renders using the last forecast run (stored in session_state),
+# so it survives Streamlit reruns without recomputing predictions.
+# ============================================================
+if "last_preds" in st.session_state and models:
+    st.divider()
+    st.markdown("### 🔍 Why did the model predict this? (SHAP Explainability)")
+    st.caption(
+        "Each bar shows how much a feature pushed the predicted AQI up (red) or down (green) "
+        "compared to the model's average prediction, for the selected day."
+    )
+
+    with st.expander("📊 View SHAP Feature Contributions", expanded=False):
+        day_choice = st.radio(
+            "Select forecast day",
+            options=["Day 1", "Day 2", "Day 3"],
+            horizontal=True,
+            key="shap_day_choice",
+        )
+
+        day_idx = int(day_choice.split(" ")[1]) - 1
+        model_info = models[day_choice]
+        model = model_info["model"]
+        feature_names = model_info["features"]
+        x_vec = st.session_state["last_x_vectors"][day_choice]
+        pred_value = st.session_state["last_preds"][day_idx]
+        date_label = st.session_state["last_date_labels"][day_idx]
+
+        try:
+            with st.spinner("Computing SHAP values..."):
+                contrib_df, base_value = compute_shap_for_day(model, feature_names, x_vec)
+
+            top_n = min(10, len(contrib_df))
+            shap_fig = shap_bar_chart(contrib_df, f"Top {top_n} Feature Contributions — {day_choice} ({date_label})", top_n=top_n)
+            if PLOTLY_AVAILABLE and shap_fig is not None:
+                st.plotly_chart(shap_fig, use_container_width=True)
+            else:
+                # Fallback: show table of top contributions
+                st.write(contrib_df.head(top_n)[["feature","shap_value"]].rename(columns={"feature":"Feature","shap_value":"SHAP Contribution"}).reset_index(drop=True))
+
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.markdown(f"""
+                <div class="metric-card">
+                    <div class="metric-label">Model Base Value</div>
+                    <div class="metric-value">{base_value:.1f}</div>
+                </div>
+                """, unsafe_allow_html=True)
+            with c2:
+                st.markdown(f"""
+                <div class="metric-card">
+                    <div class="metric-label">Sum of Contributions</div>
+                    <div class="metric-value">{contrib_df['shap_value'].sum():.1f}</div>
+                </div>
+                """, unsafe_allow_html=True)
+            with c3:
+                st.markdown(f"""
+                <div class="metric-card">
+                    <div class="metric-label">Final Prediction</div>
+                    <div class="metric-value">{pred_value:.1f}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            with st.expander("📋 View Full Feature Contribution Table"):
+                display_df = contrib_df[["feature", "shap_value"]].reset_index(drop=True)
+                display_df.columns = ["Feature", "SHAP Contribution"]
+                st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+        except Exception as shap_err:
+            st.error(f"SHAP computation error: {shap_err}")
+else:
+    st.caption("Run a forecast above to unlock SHAP explainability.")
