@@ -300,7 +300,12 @@ def render_shap_explainability(model, feature_names, historical, forecast_daily,
         explainer = shap.Explainer(model, background)
         explanation = explainer(x_vec)
 
-        values = np.asarray(explanation.values)[0]
+        values = np.asarray(explanation.values)
+        if values.ndim > 2:
+            values = values.reshape(values.shape[0], -1)
+        if values.ndim == 2 and values.shape[0] == 1:
+            values = values[0]
+
         contribs = pd.Series(np.abs(values), index=feature_names).sort_values(ascending=False).head(8)
 
         st.markdown(f"### 🔍 SHAP Explainability — {day_label}")
@@ -486,41 +491,70 @@ def build_feature_vector(historical, forecast_daily, feature_names):
             raise ValueError(f"Missing rolling feature {stat} over {window} days.")
         return value
 
+    def canonical_key(name):
+        return re.sub(r"[^a-z0-9]+", "_", str(name).strip().lower()).strip("_")
+
     feature_vector = []
     for feature in feature_names:
-        if match := re.match(r"aqi_lag_(\d+)$", feature):
+        key = canonical_key(feature)
+
+        if match := re.match(r"^aqi_lag[_-]?([0-9]+)$", key):
             feature_vector.append(get_lag("AQI", int(match.group(1))))
-        elif match := re.match(r"pm25_lag_(\d+)$", feature):
+        elif match := re.match(r"^(?:pm2_5|pm25|pm_25)_lag[_-]?([0-9]+)$", key):
             feature_vector.append(get_lag("pm2_5", int(match.group(1))))
-        elif match := re.match(r"temp_lag_(\d+)$", feature):
+        elif match := re.match(r"^(?:temp|temperature|temperature_2m)_lag[_-]?([0-9]+)$", key):
             feature_vector.append(get_lag("temperature_2m", int(match.group(1))))
-        elif match := re.match(r"aqi_roll_(mean|max|min|std)_(\d+)$", feature):
+        elif match := re.match(r"^aqi_rolling_([0-9]+)d_(mean|max|min|std)$", key):
+            stat = match.group(2)
+            window = int(match.group(1))
+            feature_vector.append(get_roll(stat, window))
+        elif match := re.match(r"^aqi_roll_(mean|max|min|std)_(\d+)$", key):
             stat = match.group(1)
             window = int(match.group(2))
             feature_vector.append(get_roll(stat, window))
-        elif feature == "sin_day":
-            day_of_year = latest_date.timetuple().tm_yday
-            feature_vector.append(np.sin(2 * np.pi * day_of_year / 365.25))
-        elif feature == "cos_day":
-            day_of_year = latest_date.timetuple().tm_yday
-            feature_vector.append(np.cos(2 * np.pi * day_of_year / 365.25))
-        elif feature == "month":
+        elif key in {"sin_day", "doy_sin", "month_sin"}:
+            if key == "month_sin":
+                value = np.sin(2 * np.pi * latest_date.month / 12)
+            else:
+                day_of_year = latest_date.timetuple().tm_yday
+                value = np.sin(2 * np.pi * day_of_year / 365.25)
+            feature_vector.append(value)
+        elif key in {"cos_day", "doy_cos", "month_cos"}:
+            if key == "month_cos":
+                value = np.cos(2 * np.pi * latest_date.month / 12)
+            else:
+                day_of_year = latest_date.timetuple().tm_yday
+                value = np.cos(2 * np.pi * day_of_year / 365.25)
+            feature_vector.append(value)
+        elif key in {"month", "month_number"}:
             feature_vector.append(latest_date.month)
-        elif feature == "dayofweek":
+        elif key in {"dayofweek", "day_of_week"}:
             feature_vector.append(latest_date.weekday())
-        elif match := re.match(r"(temp|humidity|wind)_future_h(\d+)$", feature):
-            kind = match.group(1)
-            horiz = int(match.group(2))
+        elif key in {"day_of_year", "doy"}:
+            feature_vector.append(latest_date.timetuple().tm_yday)
+        elif key in {"is_weekend"}:
+            feature_vector.append(int(latest_date.weekday() >= 5))
+        elif match := re.match(r"^(?:temp|temperature|temperature_2m)_future_h(\d+)$", key):
+            horiz = int(match.group(1))
             target_date = latest_date + timedelta(days=horiz)
             if target_date not in forecast_daily.index.date:
                 raise ValueError(f"Forecast weather not available for {target_date}.")
             weather_row = forecast_daily.loc[forecast_daily.index.date == target_date].iloc[0]
-            if kind == "temp":
-                feature_vector.append(weather_row["temperature_2m"])
-            elif kind == "humidity":
-                feature_vector.append(weather_row["relative_humidity_2m"])
-            else:
-                feature_vector.append(weather_row["wind_speed_10m"])
+            feature_vector.append(weather_row["temperature_2m"])
+        elif match := re.match(r"^(?:humidity|relative_humidity|relative_humidity_2m)_future_h(\d+)$", key):
+            horiz = int(match.group(1))
+            target_date = latest_date + timedelta(days=horiz)
+            if target_date not in forecast_daily.index.date:
+                raise ValueError(f"Forecast weather not available for {target_date}.")
+            weather_row = forecast_daily.loc[forecast_daily.index.date == target_date].iloc[0]
+            feature_vector.append(weather_row["relative_humidity_2m"])
+        elif match := re.match(r"^(?:wind|wind_speed|wind_speed_10m)_future_h(\d+)$", key):
+            horiz = int(match.group(1))
+            target_date = latest_date + timedelta(days=horiz)
+            if target_date not in forecast_daily.index.date:
+                raise ValueError(f"Forecast weather not available for {target_date}.")
+            weather_row = forecast_daily.loc[forecast_daily.index.date == target_date].iloc[0]
+            feature_vector.append(weather_row["wind_speed_10m"])
         else:
             raise ValueError(f"Unknown feature name: {feature}")
 
