@@ -35,10 +35,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements-retrain.txt
+          python -m pip install "hopsworks==5.0.*"
 
       - name: Verify dependencies
         run: |
-          python -c "import hopsworks, joblib, numpy, pandas, requests, sklearn; print('Dependencies loaded successfully')"
+          python -c "import hopsworks, joblib, numpy, pandas, requests, sklearn; print('Dependencies loaded successfully'); print('Hopsworks version:', hopsworks.__version__)"
 
       - name: Run retraining script
         env:

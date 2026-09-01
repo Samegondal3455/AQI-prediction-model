@@ -178,6 +178,19 @@ The app calculates AQI using model inputs such as:
 
 This helps capture both short-term pollution patterns and seasonal changes in air quality.
 
+## SHAP Explainability
+
+To make the AQI forecasts more transparent, the project uses SHAP (SHapley Additive exPlanations) to explain the model output for each forecast horizon. The analysis workflow in `new.ipynb` computes SHAP values on the validation set and produces summary plots that highlight which inputs contribute most to a predicted AQI increase or decrease.
+
+The most influential features are usually:
+
+- lagged AQI and PM2.5 values from recent days
+- rolling AQI statistics and short-term pollution trends
+- temperature, humidity, and wind-related conditions
+- seasonal or cyclical features such as day-of-year effects
+
+This gives stakeholders a clearer view of why the model predicts elevated pollution on a particular day and helps communicate risk in a more interpretable way alongside the forecast dashboard.
+
 ## Deployment on Streamlit Community Cloud
 
 To deploy this project on Streamlit Cloud:
